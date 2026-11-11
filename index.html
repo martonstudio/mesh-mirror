@@ -84,14 +84,14 @@ const pointFrag = `varying float vA; varying vec3 vC;
 const TUNNEL_LEN = 36, CELL = 0.5;
 const tunnelMat = new THREE.ShaderMaterial({
   uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uColor: { value: TUNNEL_COLOR }, uTime: { value: 0 }, uPump: { value: 1 } },
-  vertexShader: `attribute float ring; uniform float uScroll, uLen; varying float vD;
-    void main(){ vec3 p = position;
+  vertexShader: `attribute float ring; uniform float uScroll, uLen; varying float vD, vB;
+    void main(){ vec3 p = position; vB = ring > 1.5 ? 2.4 : (ring > .5 ? .45 : .8);
       if (ring > .5) p.z = -mod(-p.z - uScroll, uLen);
       vec4 mv = modelViewMatrix * vec4(p, 1.); vD = -mv.z; gl_Position = projectionMatrix * mv; }`,
-  fragmentShader: `uniform vec3 uColor; uniform float uTime, uPump; varying float vD;
+  fragmentShader: `uniform vec3 uColor; uniform float uTime, uPump; varying float vD, vB;
     void main(){ float a = exp(-vD * .1) * smoothstep(.3, 1.8, vD);
       a *= .5 + .5 * sin(vD * .9 - uTime * 2.6);            // light pulses running down the tunnel
-      gl_FragColor = vec4(uColor * a * 1.5 * uPump, 1.); }`,
+      gl_FragColor = vec4(uColor * a * 1.5 * uPump * vB, 1.); }`,
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
 });
 
@@ -163,8 +163,8 @@ function buildTunnel(rx, ry) {
   for (let i = 0; i <= nx; i++) { const x = -rx + 2 * rx * i / nx; seg(x, -ry, Z0, x, -ry, -TUNNEL_LEN, 0); seg(x, ry, Z0, x, ry, -TUNNEL_LEN, 0); }
   for (let i = 1; i < ny; i++) { const y = -ry + 2 * ry * i / ny; seg(-rx, y, Z0, -rx, y, -TUNNEL_LEN, 0); seg(rx, y, Z0, rx, y, -TUNNEL_LEN, 0); }
   for (let d = 0; d < TUNNEL_LEN; d += CELL) {
-    const z = -d;
-    seg(-rx, -ry, z, rx, -ry, z, 1); seg(rx, -ry, z, rx, ry, z, 1); seg(rx, ry, z, -rx, ry, z, 1); seg(-rx, ry, z, -rx, -ry, z, 1);
+    const z = -d, r = Math.round(d / CELL) % 4 === 0 ? 2 : 1;
+    seg(-rx, -ry, z, rx, -ry, z, r); seg(rx, -ry, z, rx, ry, z, r); seg(rx, ry, z, -rx, ry, z, r); seg(-rx, ry, z, -rx, -ry, z, r);
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
@@ -400,7 +400,7 @@ function buildAudio(ctx) {
   A.mainLP2 = ctx.createBiquadFilter(); A.mainLP2.type = "lowpass"; A.mainLP2.Q.value = 0.7; A.mainLP2.frequency.value = 2000;   // second stage = steeper cut
   A.mainG = ctx.createGain(); A.mainG.gain.value = 0.7;
   A.mainLP.connect(A.mainLP2).connect(A.mainG).connect(A.master);
-  A.kicks = []; A.acid = 0.5;
+  A.kicks = []; A.acid = 0.5; A.acidVol = 1;
   const len = Math.floor(ctx.sampleRate * 3.2), ir = ctx.createBuffer(2, len, ctx.sampleRate);
   for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2); }
   A.rev = ctx.createConvolver(); A.rev.buffer = ir;
@@ -468,17 +468,19 @@ function tick(A, step, t) {
       const f = mtof(33 + n);
       if (prev[2] && prev[0] != null) A.acidOsc.frequency.setTargetAtTime(f, t, 0.025); else A.acidOsc.frequency.setValueAtTime(f, t);
       const amt = (acc ? 3400 : 2200) * (0.25 + 0.75 * A.acid);     // the squelch gets bigger as the filter opens
-      A.acidG.gain.setTargetAtTime(acc ? 0.42 : 0.3, t, 0.004);
+      A.acidG.gain.setTargetAtTime((acc ? 0.42 : 0.3) * A.acidVol, t, 0.004);
       for (const fl of [A.acidF, A.acidF2]) { fl.detune.setValueAtTime(amt, t); fl.detune.setTargetAtTime(0, t + 0.002, acc ? 0.1 : 0.07); }
       if (!slide) A.acidG.gain.setTargetAtTime(0, t + S16 * 0.6, 0.012);
     }
   }
 }
 
-// open: 0 = face close (drums and pad filtered out, quieter) .. 1 = far (fully open)
-// acid: 0 = face at screen left (acid dull and closed) .. 1 = right (bright, resonant, squelchy)
+// open: 0 = face close (drums and pad filtered out, acid line in front) .. 1 = far (drums and pad fully open, acid line filtered out)
+// acid: 0 = face at screen left (acid dull and closed) .. 1 = right (bright, resonant, squelchy); only has room to open while the face is close
 function applyAudioCtl(A, open, acid, now = A.ctx.currentTime) {
-  A.acid = acid;
+  const near = Math.min(1, (1 - open) * 1.6);               // 1 while the face is close, falling to 0 as it moves far away
+  acid *= near;                                             // far away closes the acid filter whatever the left/right position
+  A.acid = acid; A.acidVol = 0.15 + 0.85 * near;
   const f = 70 * Math.pow(230, open);                       // 70 Hz .. 16 kHz
   A.mainLP.frequency.setTargetAtTime(f, now, 0.05); A.mainLP2.frequency.setTargetAtTime(f, now, 0.05);
   A.mainG.gain.setTargetAtTime(0.25 + 0.75 * Math.pow(open, 0.7), now, 0.05);
@@ -512,7 +514,7 @@ let last = performance.now(), lastVideoTime = -1;
 let results = null;
 const faceC = new THREE.Vector2(0, 0), faceTarget = new THREE.Vector2(0, 0);   // swirl axis follows the face
 const headTarget = new THREE.Vector3(0, 0, 0);                                  // tunnel rotation target (x, y, z)
-let emitAcc = 0, flySpeed = 1.5, flyPos = 0, acidS = 0.5;
+let emitAcc = 0, flySpeed = 8, flyPos = 0, acidS = 0.5;
 const SWIRL = 0.32, TURB = 0.55, DRAG = 0.45;
 
 // Start just inside the face outline and behind the mask, so particles emerge from behind it.
@@ -610,14 +612,14 @@ function frame(now) {
     kick = lastK >= 0 ? Math.exp(-(now - lastK) * 7) : 0;
   }
   // flying: face close = fast, far = slow
-  flySpeed += ((anyFace ? 0.8 + 9 * Math.pow(1 - audioOpen, 1.5) : 1.5) - flySpeed) * Math.min(1, dt * 3);
+  flySpeed += ((anyFace ? 8 + 5 * Math.pow(1 - audioOpen, 1.5) : 8) - flySpeed) * Math.min(1, dt * 3);
   acidS += (audioAcid - acidS) * Math.min(1, dt * 6);
   TUNNEL_COLOR.lerpColors(TUN_L, TUN_R, acidS);
   halo.visible = anyFace;
   haloMat.uniforms.uI.value = 0.22 + 0.55 * kick;
   if (!reduceMotion) {
     flyPos += flySpeed * dt;
-    tunnelMat.uniforms.uScroll.value = flyPos % CELL;
+    tunnelMat.uniforms.uScroll.value = flyPos % (CELL * 4);
     tunnelMat.uniforms.uTime.value = t;
     tunnelMat.uniforms.uPump.value = 0.75 + 0.9 * kick;
     propMat.uniforms.uScroll.value = dustMat.uniforms.uScroll.value = flyPos % TUNNEL_LEN;
