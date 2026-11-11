@@ -29,7 +29,8 @@ const MAX_FACES = 2;
 const EMIT_MAX = 10000;
 const LINE_COLOR = new THREE.Color("#9be7ff");
 const VIOLET = new THREE.Color("#b28cff");
-const TUNNEL_COLOR = new THREE.Color("#ff7a1a");   // warm orange against the cyan/violet mesh
+const TUNNEL_COLOR = new THREE.Color("#ff7a1a");
+const TUN_L = new THREE.Color("#b01030"), TUN_R = new THREE.Color("#ffd23a");   // face left = deep red, face right = hot yellow   // warm orange against the cyan/violet mesh
 const FOV = 50;
 const CAM_Z = 1 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));   // z=0 plane spans y in [-1,1]
 
@@ -76,35 +77,53 @@ let showVideo = false;
 /* ---------- shared soft-point shader ---------- */
 const pointFrag = `varying float vA; varying vec3 vC;
   void main(){ vec2 d = gl_PointCoord - .5; float r = length(d); if (r > .5) discard;
-    float a = smoothstep(.5, .0, r); gl_FragColor = vec4(vC * a * vA, 1.); }`;
+    float a = smoothstep(.5, .0, r); a = a * a * .55 + smoothstep(.14, .0, r);   // soft halo + bright core
+    gl_FragColor = vec4(vC * a * vA, 1.); }`;
 
 /* ---------- grid tunnel (pivots at the camera, turns with the head) ---------- */
 const TUNNEL_LEN = 36, CELL = 0.5;
 const tunnelMat = new THREE.ShaderMaterial({
-  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uColor: { value: TUNNEL_COLOR }, uTime: { value: 0 } },
+  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uColor: { value: TUNNEL_COLOR }, uTime: { value: 0 }, uPump: { value: 1 } },
   vertexShader: `attribute float ring; uniform float uScroll, uLen; varying float vD;
     void main(){ vec3 p = position;
       if (ring > .5) p.z = -mod(-p.z - uScroll, uLen);
       vec4 mv = modelViewMatrix * vec4(p, 1.); vD = -mv.z; gl_Position = projectionMatrix * mv; }`,
-  fragmentShader: `uniform vec3 uColor; uniform float uTime; varying float vD;
+  fragmentShader: `uniform vec3 uColor; uniform float uTime, uPump; varying float vD;
     void main(){ float a = exp(-vD * .1) * smoothstep(.3, 1.8, vD);
       a *= .5 + .5 * sin(vD * .9 - uTime * 2.6);            // light pulses running down the tunnel
-      gl_FragColor = vec4(uColor * a * 1.5, 1.); }`,
+      gl_FragColor = vec4(uColor * a * 1.5 * uPump, 1.); }`,
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
 });
 
 /* wire boxes and ring pairs that fly past along the tunnel */
 const propMat = new THREE.ShaderMaterial({
-  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN } },
-  vertexShader: `attribute vec3 center, col; uniform float uScroll, uLen; varying float vD; varying vec3 vC;
+  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uTime: { value: 0 } },
+  vertexShader: `attribute vec3 center, col, spin; uniform float uScroll, uLen, uTime; varying float vD; varying vec3 vC;
     void main(){ vec3 c = center; c.z = -mod(-c.z - uScroll, uLen);
-      vec4 mv = modelViewMatrix * vec4(c + position, 1.); vD = -mv.z; vC = col; gl_Position = projectionMatrix * mv; }`,
+      float a = uTime * spin.x + spin.z, b = uTime * spin.y + spin.z * 1.7;     // each shape tumbles on its own axes
+      vec3 q = position;
+      q.xz = mat2(cos(a), -sin(a), sin(a), cos(a)) * q.xz;
+      q.yz = mat2(cos(b), -sin(b), sin(b), cos(b)) * q.yz;
+      vec4 mv = modelViewMatrix * vec4(c + q, 1.); vD = -mv.z; vC = col; gl_Position = projectionMatrix * mv; }`,
   fragmentShader: `varying float vD; varying vec3 vC;
     void main(){ float a = exp(-vD * .09) * smoothstep(.2, 1.4, vD); gl_FragColor = vec4(vC * a, 1.); }`,
   transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
 });
 const props = new THREE.LineSegments(new THREE.BufferGeometry(), propMat);
 props.frustumCulled = false; props.renderOrder = -1;
+/* dust that streams past, so speed is visible */
+const dustMat = new THREE.ShaderMaterial({
+  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uPR: { value: renderer.getPixelRatio() } },
+  vertexShader: `attribute float seed; uniform float uScroll, uLen, uPR; varying float vA; varying vec3 vC;
+    void main(){ vec3 p = position; p.z = -mod(-p.z - uScroll, uLen);
+      vec4 mv = modelViewMatrix * vec4(p, 1.); float d = max(.3, -mv.z);
+      vA = exp(-d * .08) * smoothstep(.2, 1.2, d) * (.35 + .65 * seed); vC = mix(vec3(1., .8, .5), vec3(.7, .9, 1.), seed);
+      gl_Position = projectionMatrix * mv; gl_PointSize = (2. + 4. * seed) * uPR * clamp(2.2 / d, .3, 5.); }`,
+  fragmentShader: pointFrag,
+  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+});
+const dust = new THREE.Points(new THREE.BufferGeometry(), dustMat);
+dust.frustumCulled = false; dust.renderOrder = -1;
 const PROP_COLORS = ["#ffb347", "#ffe066", "#ff3d81", "#35e0a1"].map(c => new THREE.Color(c));
 
 /* soft light beams fanning out from the far end */
@@ -130,7 +149,7 @@ const tunnel = new THREE.LineSegments(new THREE.BufferGeometry(), tunnelMat);
 tunnel.frustumCulled = false; tunnel.renderOrder = -1;
 const tunnelGroup = new THREE.Group();
 tunnelGroup.position.z = CAM_Z;
-tunnelGroup.add(tunnel, props, beams);
+tunnelGroup.add(tunnel, props, dust, beams);
 scene.add(tunnelGroup);
 let tunnelKey = "";
 function buildTunnel(rx, ry) {
@@ -153,9 +172,11 @@ function buildTunnel(rx, ry) {
   tunnel.geometry.dispose();
   tunnel.geometry = g;
 
-  const pp = [], pc = [], pk = [];
-  const pseg = (c, k, ax, ay, az, bx, by, bz) => { pp.push(ax, ay, az, bx, by, bz); pc.push(c[0], c[1], c[2], c[0], c[1], c[2]); pk.push(k.r, k.g, k.b, k.r, k.g, k.b); };
+  const pp = [], pc = [], pk = [], ps = [];
+  let sp = [0, 0, 0];
+  const pseg = (c, k, ax, ay, az, bx, by, bz) => { pp.push(ax, ay, az, bx, by, bz); pc.push(c[0], c[1], c[2], c[0], c[1], c[2]); pk.push(k.r, k.g, k.b, k.r, k.g, k.b); ps.push(sp[0], sp[1], sp[2], sp[0], sp[1], sp[2]); };
   for (let n = 0; n < 44; n++) {
+    sp = [(Math.random() - 0.5) * 2.6, (Math.random() - 0.5) * 1.8, Math.random() * 6.28];
     const k = PROP_COLORS[n % PROP_COLORS.length], d = -Math.random() * TUNNEL_LEN;
     if (n % 3) {   // wire box hugging a wall
       const w = 0.15 + Math.random() * 0.35, h = 0.15 + Math.random() * 0.5, dp = 0.2 + Math.random() * 0.8;
@@ -176,8 +197,17 @@ function buildTunnel(rx, ry) {
   pg.setAttribute("position", new THREE.Float32BufferAttribute(pp, 3));
   pg.setAttribute("center", new THREE.Float32BufferAttribute(pc, 3));
   pg.setAttribute("col", new THREE.Float32BufferAttribute(pk, 3));
+  pg.setAttribute("spin", new THREE.Float32BufferAttribute(ps, 3));
   props.geometry.dispose();
   props.geometry = pg;
+
+  const DN = 1400, dp = new Float32Array(DN * 3), ds = new Float32Array(DN);
+  for (let i = 0; i < DN; i++) { dp[i * 3] = (Math.random() * 2 - 1) * rx; dp[i * 3 + 1] = (Math.random() * 2 - 1) * ry; dp[i * 3 + 2] = -Math.random() * TUNNEL_LEN; ds[i] = Math.random(); }
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute("position", new THREE.BufferAttribute(dp, 3));
+  dg.setAttribute("seed", new THREE.BufferAttribute(ds, 1));
+  dust.geometry.dispose();
+  dust.geometry = dg;
 }
 
 /* ---------- emitted particles (CPU ring buffer) ---------- */
@@ -219,6 +249,20 @@ const FEATURES = [
 ];
 const OVAL_IDX = [...new Set(OVAL.map(e => e.start))];
 const N_LM = 478;
+
+// animated glow behind the face: a soft spiky halo that breathes with the kick drum
+const haloMat = new THREE.ShaderMaterial({
+  uniforms: { uI: { value: 0.3 }, uTime: { value: 0 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv * 2. - 1.; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }`,
+  fragmentShader: `uniform float uI, uTime; varying vec2 vUv;
+    void main(){ float d = length(vUv), ang = atan(vUv.y, vUv.x);
+      float a = pow(max(0., 1. - d), 2.2) * (.7 + .3 * sin(ang * 9. + uTime * 1.3) * sin(ang * 4. - uTime * .7));
+      vec3 c = mix(vec3(.3, .8, 1.), vec3(1., .25, .7), .5 + .5 * sin(uTime * .5 + d * 3.));
+      gl_FragColor = vec4(c * a * uI, 1.); }`,
+  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+});
+const halo = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), haloMat);
+halo.frustumCulled = false; halo.visible = false; halo.renderOrder = 2; scene.add(halo);
 
 // triangles recovered from the tessellation edges (every 3-cycle of edges is one face of the mesh)
 const TRIS = (() => {
@@ -352,7 +396,11 @@ function buildAudio(ctx) {
   const out = ctx.createDynamicsCompressor(); out.threshold.value = -14; out.ratio.value = 6; out.connect(ctx.destination);
   A.master = ctx.createGain(); A.master.gain.value = 0.7; A.master.connect(out);
   // main filter: drums, pad and reverb all pass through it (face distance opens and closes it)
-  A.mainLP = ctx.createBiquadFilter(); A.mainLP.type = "lowpass"; A.mainLP.Q.value = 1.2; A.mainLP.frequency.value = 2000; A.mainLP.connect(A.master);
+  A.mainLP = ctx.createBiquadFilter(); A.mainLP.type = "lowpass"; A.mainLP.Q.value = 1.4; A.mainLP.frequency.value = 2000;
+  A.mainLP2 = ctx.createBiquadFilter(); A.mainLP2.type = "lowpass"; A.mainLP2.Q.value = 0.7; A.mainLP2.frequency.value = 2000;   // second stage = steeper cut
+  A.mainG = ctx.createGain(); A.mainG.gain.value = 0.7;
+  A.mainLP.connect(A.mainLP2).connect(A.mainG).connect(A.master);
+  A.kicks = []; A.acid = 0.5;
   const len = Math.floor(ctx.sampleRate * 3.2), ir = ctx.createBuffer(2, len, ctx.sampleRate);
   for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2); }
   A.rev = ctx.createConvolver(); A.rev.buffer = ir;
@@ -374,7 +422,8 @@ function buildAudio(ctx) {
   for (let i = 0; i < 1024; i++) curve[i] = Math.tanh((i / 511.5 - 1) * 2.2);
   shaper.curve = curve;
   A.acidG = ctx.createGain(); A.acidG.gain.value = 0;
-  A.acidOsc.connect(A.acidF).connect(shaper).connect(A.acidG); A.acidG.connect(A.master);
+  A.acidF2 = ctx.createBiquadFilter(); A.acidF2.type = "lowpass"; A.acidF2.Q.value = 0.7; A.acidF2.frequency.value = 900;
+  A.acidOsc.connect(A.acidF).connect(A.acidF2).connect(shaper).connect(A.acidG); A.acidG.connect(A.master);
   const dl = ctx.createDelay(1), fb = ctx.createGain(), wet = ctx.createGain();
   dl.delayTime.value = S16 * 3; fb.gain.value = 0.35; wet.gain.value = 0.3;
   A.acidG.connect(dl); dl.connect(fb).connect(dl); dl.connect(wet).connect(A.master);
@@ -398,6 +447,7 @@ function tick(A, step, t) {
     o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.11);
     g.gain.setValueAtTime(0.9, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.38);
     o.connect(g).connect(A.mainLP); o.start(t); o.stop(t + 0.4);
+    A.kicks.push(t); if (A.kicks.length > 8) A.kicks.shift();
   }
   if (s % 4 === 2) noiseHit(A, t, "highpass", 7000, 0.11, 0.09, false);          // off-beat hat
   else if (Math.random() < 0.6) noiseHit(A, t, "highpass", 9000, 0.02 + Math.random() * 0.02, 0.03, false);
@@ -412,17 +462,29 @@ function tick(A, step, t) {
     g.gain.setValueAtTime(0.05, t); g.gain.exponentialRampToValueAtTime(0.0005, t + 1.5);
     o.connect(g); g.connect(A.rev); g.connect(A.mainLP); o.start(t); o.stop(t + 1.6);
   }
-  if (bar >= 4) {                                                                // acid line joins after four bars
+  if (bar >= 1) {                                                                // acid line joins after one bar
     const [n, acc, slide] = ACID[s], prev = ACID[(s + 15) % 16];
     if (n != null) {
       const f = mtof(33 + n);
       if (prev[2] && prev[0] != null) A.acidOsc.frequency.setTargetAtTime(f, t, 0.025); else A.acidOsc.frequency.setValueAtTime(f, t);
-      A.acidG.gain.setTargetAtTime(acc ? 0.36 : 0.26, t, 0.004);
-      A.acidF.detune.setValueAtTime(acc ? 3200 : 2000, t);
-      A.acidF.detune.setTargetAtTime(0, t + 0.002, acc ? 0.1 : 0.07);
+      const amt = (acc ? 3400 : 2200) * (0.25 + 0.75 * A.acid);     // the squelch gets bigger as the filter opens
+      A.acidG.gain.setTargetAtTime(acc ? 0.42 : 0.3, t, 0.004);
+      for (const fl of [A.acidF, A.acidF2]) { fl.detune.setValueAtTime(amt, t); fl.detune.setTargetAtTime(0, t + 0.002, acc ? 0.1 : 0.07); }
       if (!slide) A.acidG.gain.setTargetAtTime(0, t + S16 * 0.6, 0.012);
     }
   }
+}
+
+// open: 0 = face close (drums and pad filtered out, quieter) .. 1 = far (fully open)
+// acid: 0 = face at screen left (acid dull and closed) .. 1 = right (bright, resonant, squelchy)
+function applyAudioCtl(A, open, acid, now = A.ctx.currentTime) {
+  A.acid = acid;
+  const f = 70 * Math.pow(230, open);                       // 70 Hz .. 16 kHz
+  A.mainLP.frequency.setTargetAtTime(f, now, 0.05); A.mainLP2.frequency.setTargetAtTime(f, now, 0.05);
+  A.mainG.gain.setTargetAtTime(0.25 + 0.75 * Math.pow(open, 0.7), now, 0.05);
+  const fa = 80 * Math.pow(110, acid);                      // 80 Hz .. 8.8 kHz
+  A.acidF.frequency.setTargetAtTime(fa, now, 0.05); A.acidF2.frequency.setTargetAtTime(fa * 1.5, now, 0.05);
+  A.acidF.Q.setTargetAtTime(4 + 14 * acid, now, 0.05);
 }
 
 let A = null, nextT = 0, step = 0;
@@ -450,7 +512,7 @@ let last = performance.now(), lastVideoTime = -1;
 let results = null;
 const faceC = new THREE.Vector2(0, 0), faceTarget = new THREE.Vector2(0, 0);   // swirl axis follows the face
 const headTarget = new THREE.Vector3(0, 0, 0);                                  // tunnel rotation target (x, y, z)
-let emitAcc = 0;
+let emitAcc = 0, flySpeed = 1.5, flyPos = 0, acidS = 0.5;
 const SWIRL = 0.32, TURB = 0.55, DRAG = 0.45;
 
 // Start just inside the face outline and behind the mask, so particles emerge from behind it.
@@ -466,8 +528,8 @@ function spawn(F, cx, cy, fw) {
   eVel[j] = dx * out - dy * sw;
   eVel[j + 1] = dy * out + dx * sw;
   eVel[j + 2] = Math.random() < 0.4 ? Math.random() * 0.5 : -(0.05 + Math.random() * 0.5);
-  eMax[i] = 3.5 + Math.random() * 4.5; eLife[i] = 1;
-  eSize[i] = 2.5 + Math.random() * 4.5; eHue[i] = Math.random();
+  eMax[i] = 2.5 + Math.random() * 3.5; eLife[i] = 1;
+  eSize[i] = 5 + Math.random() * 9; eHue[i] = Math.random();
 }
 
 function frame(now) {
@@ -508,7 +570,8 @@ function frame(now) {
       const cl = THREE.MathUtils.clamp;
       headTarget.set(cl(pitch * 0.9, -0.45, 0.45), cl(-yaw * 0.9, -0.5, 0.5), cl(Math.atan2(ry - ly, rx - lx) * 0.6, -0.5, 0.5));
       faceTarget.set(cx, cy);
-      audioAcid = THREE.MathUtils.clamp(cx / aspect * 0.5 + 0.5, 0, 1);   // face at screen left = acid filter closed, right = open
+      halo.position.set(cx, cy, -fw * 0.3); halo.scale.setScalar(fw * 3.4);
+      audioAcid = THREE.MathUtils.clamp(cx / (aspect * 0.6) * 0.5 + 0.5, 0, 1);   // face at screen left = acid filter closed, right = open
     }
     anyFace = true;
 
@@ -518,7 +581,7 @@ function frame(now) {
     F.far = (F.far ?? far) + (far - (F.far ?? far)) * Math.min(1, dt * 4);
     if (f === 0) audioOpen = F.far;                                       // close = main filter closed, far = open
     if (!reduceMotion) {
-      emitAcc += (40 + 1700 * F.far * F.far) * dt;
+      emitAcc += (260 + 2100 * F.far * F.far) * dt;
       const n = Math.floor(emitAcc); emitAcc -= n;
       for (let k = 0; k < n; k++) spawn(F, cx, cy, fw);
     }
@@ -539,17 +602,30 @@ function frame(now) {
   tunnelGroup.quaternion.slerp(targetQ, Math.min(1, dt * (sensorOn ? 12 : 5)));
   lightDir.set(0, 0, -1).applyQuaternion(tunnelGroup.quaternion);       // light sits toward the tunnel's far end, exaggerated
   uLight.value.set(lightDir.x * 3 + 0.15, lightDir.y * 3 + 0.35, 1).normalize();
+  // kick drum envelope (1 on the beat, fading), read from the audio clock; silent fallback follows the same tempo
+  let kick = Math.exp(-((t * BPM / 60) % 1) * 4);
+  if (A && A.ctx.state === "running") {
+    const now = A.ctx.currentTime; let lastK = -1;
+    for (const k of A.kicks) if (k <= now && k > lastK) lastK = k;
+    kick = lastK >= 0 ? Math.exp(-(now - lastK) * 7) : 0;
+  }
+  // flying: face close = fast, far = slow
+  flySpeed += ((anyFace ? 0.8 + 9 * Math.pow(1 - audioOpen, 1.5) : 1.5) - flySpeed) * Math.min(1, dt * 3);
+  acidS += (audioAcid - acidS) * Math.min(1, dt * 6);
+  TUNNEL_COLOR.lerpColors(TUN_L, TUN_R, acidS);
+  halo.visible = anyFace;
+  haloMat.uniforms.uI.value = 0.22 + 0.55 * kick;
   if (!reduceMotion) {
-    tunnelMat.uniforms.uScroll.value = (t * 0.6) % CELL;
+    flyPos += flySpeed * dt;
+    tunnelMat.uniforms.uScroll.value = flyPos % CELL;
     tunnelMat.uniforms.uTime.value = t;
-    propMat.uniforms.uScroll.value = (t * 2.2) % TUNNEL_LEN;
-    beams.rotation.z = t * 0.07;
+    tunnelMat.uniforms.uPump.value = 0.75 + 0.9 * kick;
+    propMat.uniforms.uScroll.value = dustMat.uniforms.uScroll.value = flyPos % TUNNEL_LEN;
+    propMat.uniforms.uTime.value = haloMat.uniforms.uTime.value = t;
+    beams.rotation.z = t * 0.12;
   }
 
-  if (A) {
-    A.mainLP.frequency.setTargetAtTime(180 * Math.pow(78, audioOpen), A.ctx.currentTime, 0.1);    // 180 Hz .. 14 kHz
-    A.acidF.frequency.setTargetAtTime(110 * Math.pow(40, audioAcid), A.ctx.currentTime, 0.1);     // 110 Hz .. 4.4 kHz
-  }
+  if (A) applyAudioCtl(A, audioOpen, audioAcid);
 
   // particle physics: swirl around the face axis + per-particle turbulence, in 3D
   const drag = 1 - DRAG * dt;
