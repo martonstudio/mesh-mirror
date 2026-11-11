@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mesh Mirror</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400&display=swap">
+<style>
+  /* Full-bleed WebGL stage, one quiet HUD in the corner. Single dark look by choice. */
+  :root {
+    --ink: #04050a;
+    --line: #9be7ff;
+    --violet: #b28cff;
+    --text: #dfe8f2;
+    --muted: #7d8a9c;
+    --panel: rgba(10, 14, 24, 0.72);
+    --display: "Space Grotesk", system-ui, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; background: var(--ink); color: var(--text); overflow: hidden; }
+  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  video { display: none; }
+  .hud {
+    position: fixed; left: max(16px, env(safe-area-inset-left, 0px)); top: max(16px, env(safe-area-inset-top, 0px));
+    display: flex; flex-direction: column; gap: 10px; max-width: min(340px, calc(100vw - 32px));
+    padding: 14px 16px; background: var(--panel); border: 1px solid rgba(155, 231, 255, 0.15);
+    border-radius: 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    transition: opacity .4s;
+  }
+  .hud.dim { opacity: 0.25; }
+  .hud.dim:hover { opacity: 1; }
+  h1 { font: 700 20px/1 var(--display); letter-spacing: 0.02em; margin: 0; }
+  h1 span { color: var(--line); }
+  .status { font: 400 12px/1.5 var(--mono); color: var(--muted); }
+  .status.err { color: #ff9b9b; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  button {
+    font: 500 13px/1 var(--display); color: var(--ink); background: var(--line);
+    border: 0; border-radius: 6px; padding: 9px 14px; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid rgba(155, 231, 255, 0.3); }
+  button.ghost[aria-pressed="true"] { border-color: var(--line); color: var(--line); }
+  button:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .keys { font: 400 11px/1.6 var(--mono); color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted></video>
+
+<div class="hud" id="hud">
+  <h1>Mesh <span>Mirror</span></h1>
+  <div class="status" id="status">Loading face tracker…</div>
+  <div class="row">
+    <button id="camBtn" disabled>Turn on camera</button>
+    <button class="ghost" id="videoBtn" aria-pressed="false">Show video</button>
+    <button class="ghost" id="fsBtn">Fullscreen</button>
+  </div>
+  <div class="keys">468-point mesh · open your mouth for more particles<br>V video · F fullscreen · H hide panel</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+} }
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+const MAX_FACES = 2;
+const BG_COUNT = 9000;
+const EMIT_MAX = 6000;
+const LINE_COLOR = new THREE.Color("#9be7ff");
+const VIOLET = new THREE.Color("#b28cff");
+
+const statusEl = document.getElementById("status");
+const camBtn = document.getElementById("camBtn");
+const videoBtn = document.getElementById("videoBtn");
+const fsBtn = document.getElementById("fsBtn");
+const hud = document.getElementById("hud");
+const video = document.getElementById("cam");
+const setStatus = (t, err = false) => { statusEl.textContent = t; statusEl.classList.toggle("err", err); };
+
+/* ---------- renderer / camera ---------- */
+const canvas = document.getElementById("stage");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x04050a, 1);
+const scene = new THREE.Scene();
+let aspect = 1;
+const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, -20, 20);
+
+/* ---------- video plane (dim mirrored feed, optional) ---------- */
+const vidTex = new THREE.VideoTexture(video);
+vidTex.colorSpace = THREE.SRGBColorSpace;
+const vidMat = new THREE.ShaderMaterial({
+  uniforms: { map: { value: vidTex }, amt: { value: 0 } },
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+  fragmentShader: `uniform sampler2D map; uniform float amt; varying vec2 vUv;
+    void main(){ vec3 c = texture2D(map, vec2(1.0 - vUv.x, vUv.y)).rgb; float g = dot(c, vec3(.299,.587,.114));
+      gl_FragColor = vec4(mix(vec3(g), c, .25) * vec3(.75,.85,1.) * amt, 1.); }`,
+  depthWrite: false,
+});
+const vidPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), vidMat);
+vidPlane.position.z = -10;
+vidPlane.visible = false;
+scene.add(vidPlane);
+let showVideo = false;
+
+/* ---------- shared soft-point shader ---------- */
+const pointFrag = `varying float vA; varying vec3 vC;
+  void main(){ vec2 d = gl_PointCoord - .5; float r = length(d); if (r > .5) discard;
+    float a = smoothstep(.5, .0, r); gl_FragColor = vec4(vC * a * vA, 1.); }`;
+
+/* ---------- background particle field (all on GPU) ---------- */
+const bgGeo = new THREE.BufferGeometry();
+const seeds = new Float32Array(BG_COUNT * 4);
+for (let i = 0; i < BG_COUNT; i++) {
+  seeds[i * 4] = Math.random() * 2 - 1;
+  seeds[i * 4 + 1] = Math.random() * 2 - 1;
+  seeds[i * 4 + 2] = Math.random();
+  seeds[i * 4 + 3] = Math.random();
+}
+bgGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(BG_COUNT * 3), 3));
+bgGeo.setAttribute("seed", new THREE.BufferAttribute(seeds, 4));
+const bgMat = new THREE.ShaderMaterial({
+  uniforms: {
+    uTime: { value: 0 }, uAspect: { value: 1 }, uPR: { value: renderer.getPixelRatio() },
+    uFace: { value: new THREE.Vector3(0, 0, 0.5) }, uFaceOn: { value: 0 }, uEnergy: { value: 0 },
+    uC1: { value: LINE_COLOR }, uC2: { value: VIOLET },
+  },
+  vertexShader: `attribute vec4 seed; uniform float uTime, uAspect, uPR, uFaceOn, uEnergy; uniform vec3 uFace, uC1, uC2;
+    varying float vA; varying vec3 vC;
+    void main(){
+      vec3 p = seed.xyz;
+      float sp = .015 + seed.w * .05;
+      p.y = mod(p.y + 1.0 + uTime * sp * (1. + uEnergy * 3.), 2.0) - 1.0;
+      p.x += .06 * sin(uTime * .25 + seed.w * 31. + p.y * 2.7) + .03 * sin(uTime * .7 + seed.z * 17.);
+      p.x *= uAspect * 1.05;
+      vec2 d = p.xy - uFace.xy; float r = length(d);
+      float push = uFaceOn * exp(-(r * r) / (uFace.z * uFace.z)) * (.35 + uEnergy * .4);
+      p.xy += normalize(d + 1e-5) * push;
+      float edge = smoothstep(1., .85, abs(p.y));
+      vA = (.25 + .75 * seed.z) * edge * (.55 + push * 1.5);
+      vC = mix(uC1, uC2, seed.w) * (.6 + uEnergy);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(p.xy, -6. + seed.z, 1.);
+      gl_PointSize = (1.2 + seed.w * seed.z * 3.5) * uPR;
+    }`,
+  fragmentShader: pointFrag,
+  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+});
+const bgPoints = new THREE.Points(bgGeo, bgMat);
+bgPoints.frustumCulled = false;
+scene.add(bgPoints);
+
+/* ---------- emitted particles (CPU ring buffer) ---------- */
+const ePos = new Float32Array(EMIT_MAX * 3);
+const eVel = new Float32Array(EMIT_MAX * 3);
+const eLife = new Float32Array(EMIT_MAX);
+const eMax = new Float32Array(EMIT_MAX).fill(1);
+const eSize = new Float32Array(EMIT_MAX);
+const eHue = new Float32Array(EMIT_MAX);
+let eHead = 0;
+const emGeo = new THREE.BufferGeometry();
+emGeo.setAttribute("position", new THREE.BufferAttribute(ePos, 3).setUsage(THREE.DynamicDrawUsage));
+emGeo.setAttribute("life", new THREE.BufferAttribute(eLife, 1).setUsage(THREE.DynamicDrawUsage));
+emGeo.setAttribute("size", new THREE.BufferAttribute(eSize, 1));
+emGeo.setAttribute("hue", new THREE.BufferAttribute(eHue, 1));
+const emMat = new THREE.ShaderMaterial({
+  uniforms: { uPR: { value: renderer.getPixelRatio() }, uC1: { value: LINE_COLOR }, uC2: { value: VIOLET } },
+  vertexShader: `attribute float life, size, hue; uniform float uPR; uniform vec3 uC1, uC2; varying float vA; varying vec3 vC;
+    void main(){ vA = clamp(life, 0., 1.); vC = mix(uC1, uC2, hue) * 1.2;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
+      gl_PointSize = size * uPR * (.4 + .6 * vA); }`,
+  fragmentShader: pointFrag,
+  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+});
+const emPoints = new THREE.Points(emGeo, emMat);
+emPoints.frustumCulled = false;
+scene.add(emPoints);
+
+/* ---------- face meshes ---------- */
+const TESS = FaceLandmarker.FACE_LANDMARKS_TESSELATION;
+const OVAL = FaceLandmarker.FACE_LANDMARKS_FACE_OVAL;
+const FEATURES = [
+  ...FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, ...FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
+  ...FaceLandmarker.FACE_LANDMARKS_LIPS, ...FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW,
+  ...FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW, ...OVAL,
+];
+const OVAL_IDX = [...new Set(OVAL.map(e => e.start))];
+const N_LM = 478;
+
+function makeLineObj(edges, color, opacity) {
+  const idx = new Uint16Array(edges.length * 2);
+  edges.forEach((e, i) => { idx[i * 2] = e.start; idx[i * 2 + 1] = e.end; });
+  const g = new THREE.BufferGeometry();
+  return { g, idx, color, opacity };
+}
+const faces = [];
+for (let f = 0; f < MAX_FACES; f++) {
+  const pos = new Float32Array(N_LM * 3);
+  const posAttr = new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage);
+  const mk = (edges, color, opacity) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", posAttr);
+    const idx = [];
+    for (const e of edges) idx.push(e.start, e.end);
+    g.setIndex(idx);
+    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false });
+    const l = new THREE.LineSegments(g, m);
+    l.frustumCulled = false; l.visible = false; scene.add(l);
+    return l;
+  };
+  const mesh = mk(TESS, LINE_COLOR, 0.38);
+  const feat = mk(FEATURES, new THREE.Color("#e9f8ff"), 0.9);
+  const vg = new THREE.BufferGeometry();
+  vg.setAttribute("position", posAttr);
+  const verts = new THREE.Points(vg, new THREE.PointsMaterial({ color: LINE_COLOR, size: 2.2, sizeAttenuation: false, transparent: true, opacity: .7, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }));
+  verts.frustumCulled = false; verts.visible = false; scene.add(verts);
+  faces.push({ pos, posAttr, mesh, feat, verts, seen: 0 });
+}
+
+/* ---------- layout ---------- */
+let W = 2, H = 2;   // world size of the video "cover" rect
+function layout() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  aspect = w / h;
+  cam.left = -aspect; cam.right = aspect; cam.top = 1; cam.bottom = -1;
+  cam.updateProjectionMatrix();
+  const va = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
+  if (aspect > va) { W = 2 * aspect; H = W / va; } else { H = 2; W = H * va; }
+  vidPlane.scale.set(W, H, 1);
+  bgMat.uniforms.uAspect.value = aspect;
+}
+window.addEventListener("resize", layout);
+layout();
+
+/* ---------- face tracker ---------- */
+let landmarker = null;
+async function loadTracker() {
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opts = (delegate) => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate,
+    },
+    runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: true,
+  });
+  try { landmarker = await FaceLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch (e) { console.warn("GPU delegate failed, using CPU", e); landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+loadTracker().then(() => {
+  setStatus("Ready. Your camera feed stays on this computer.");
+  camBtn.disabled = false;
+}).catch(e => { console.error(e); setStatus("Couldn't load the face tracker. Check your internet connection and reload.", true); });
+
+let camOn = false;
+async function startCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setStatus("This browser has no camera access here. Open the file in Chrome, Edge or Firefox.", true); return;
+  }
+  camBtn.disabled = true; setStatus("Waiting for camera permission…");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    camOn = true; layout();
+    setStatus("Tracking. Look at the camera.");
+    camBtn.textContent = "Camera on";
+    setTimeout(() => hud.classList.add("dim"), 2500);
+  } catch (e) {
+    console.error(e);
+    camBtn.disabled = false;
+    setStatus(e.name === "NotAllowedError" ? "Camera blocked. Allow it in the browser's address bar, then try again."
+      : e.name === "NotFoundError" ? "No camera found. Plug one in and try again."
+      : "Camera failed to start: " + e.message, true);
+  }
+}
+camBtn.addEventListener("click", startCamera);
+
+function toggleVideo() { showVideo = !showVideo; videoBtn.setAttribute("aria-pressed", String(showVideo)); videoBtn.textContent = showVideo ? "Hide video" : "Show video"; }
+videoBtn.addEventListener("click", toggleVideo);
+function toggleFS() { (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.())?.catch?.(() => {}); }
+fsBtn.addEventListener("click", toggleFS);
+window.addEventListener("keydown", (e) => {
+  if (e.key === "v" || e.key === "V") toggleVideo();
+  else if (e.key === "f" || e.key === "F") toggleFS();
+  else if (e.key === "h" || e.key === "H") hud.hidden = !hud.hidden;
+});
+
+/* ---------- loop ---------- */
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+let last = performance.now(), lastVideoTime = -1, energy = 0, faceTarget = new THREE.Vector3(0, 0, .5), faceOn = 0;
+let results = null;
+
+function spawn(x, y, z, cx, cy, boost) {
+  const i = eHead; eHead = (eHead + 1) % EMIT_MAX;
+  let dx = x - cx, dy = y - cy; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
+  const sp = (0.08 + Math.random() * 0.25) * (1 + boost * 2);
+  ePos[i * 3] = x; ePos[i * 3 + 1] = y; ePos[i * 3 + 2] = z;
+  eVel[i * 3] = dx * sp + (Math.random() - .5) * .05;
+  eVel[i * 3 + 1] = dy * sp + (Math.random() - .5) * .05 + .03;
+  eVel[i * 3 + 2] = 0;
+  eMax[i] = 1.2 + Math.random() * 1.8; eLife[i] = 1;
+  eSize[i] = 1.5 + Math.random() * 3.5; eHue[i] = Math.random();
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const t = now / 1000;
+
+  if (camOn && landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    results = landmarker.detectForVideo(video, now);
+  }
+
+  let anyFace = false, jaw = 0;
+  for (let f = 0; f < MAX_FACES; f++) {
+    const F = faces[f];
+    const lm = results?.faceLandmarks?.[f];
+    const on = !!lm;
+    F.mesh.visible = F.feat.visible = F.verts.visible = on;
+    if (!on) continue;
+    anyFace = true;
+    let cx = 0, cy = 0, minX = 1e9, maxX = -1e9;
+    for (let i = 0; i < lm.length && i < N_LM; i++) {
+      const x = (0.5 - lm[i].x) * W, y = (0.5 - lm[i].y) * H, z = -lm[i].z * W;
+      F.pos[i * 3] = x; F.pos[i * 3 + 1] = y; F.pos[i * 3 + 2] = z;
+      cx += x; cy += y; if (x < minX) minX = x; if (x > maxX) maxX = x;
+    }
+    F.posAttr.needsUpdate = true;
+    cx /= lm.length; cy /= lm.length;
+    const bs = results.faceBlendshapes?.[f]?.categories;
+    if (bs) { const j = bs.find(c => c.categoryName === "jawOpen"); if (j) jaw = Math.max(jaw, j.score); }
+    F.mesh.material.opacity = 0.3 + 0.1 * Math.sin(t * 2.0) + jaw * 0.3;
+    if (f === 0) faceTarget.set(cx, cy, Math.max(0.2, (maxX - minX) * 0.75));
+    if (!reduceMotion) {
+      const n = Math.floor((25 + jaw * 260) * dt * 60 / 10);
+      for (let k = 0; k < n; k++) {
+        const useOval = Math.random() < 0.7;
+        const idx = useOval ? OVAL_IDX[(Math.random() * OVAL_IDX.length) | 0] : (Math.random() * 468) | 0;
+        spawn(F.pos[idx * 3], F.pos[idx * 3 + 1], F.pos[idx * 3 + 2], cx, cy, jaw);
+      }
+    }
+  }
+
+  energy += ((anyFace ? jaw : 0) - energy) * Math.min(1, dt * 6);
+  faceOn += ((anyFace ? 1 : 0) - faceOn) * Math.min(1, dt * 3);
+  bgMat.uniforms.uFace.value.lerp(faceTarget, Math.min(1, dt * 8));
+  bgMat.uniforms.uFaceOn.value = faceOn;
+  bgMat.uniforms.uEnergy.value = energy;
+  bgMat.uniforms.uTime.value = reduceMotion ? 0 : t;
+
+  // emitted particle physics
+  for (let i = 0; i < EMIT_MAX; i++) {
+    if (eLife[i] <= 0) continue;
+    eLife[i] -= dt / eMax[i];
+    const j = i * 3;
+    eVel[j] += Math.sin(ePos[j + 1] * 6 + t) * 0.02 * dt;
+    eVel[j + 1] += 0.04 * dt;
+    eVel[j] *= 1 - 0.6 * dt; eVel[j + 1] *= 1 - 0.6 * dt;
+    ePos[j] += eVel[j] * dt; ePos[j + 1] += eVel[j + 1] * dt;
+  }
+  emGeo.attributes.position.needsUpdate = true;
+  emGeo.attributes.life.needsUpdate = true;
+  emGeo.attributes.size.needsUpdate = true;
+  emGeo.attributes.hue.needsUpdate = true;
+
+  const va = vidMat.uniforms.amt;
+  va.value += ((showVideo && camOn ? 0.45 : 0) - va.value) * Math.min(1, dt * 5);
+  vidPlane.visible = va.value > 0.01;
+
+  renderer.render(scene, cam);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
