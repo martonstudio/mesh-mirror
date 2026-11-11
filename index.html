@@ -78,7 +78,7 @@ const TUNNEL_LEN = 36, CELL = 0.5;
 const tunnelMat = new THREE.ShaderMaterial({
   uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uColor: { value: TUNNEL_COLOR }, uTime: { value: 0 }, uPump: { value: 1 } },
   vertexShader: `attribute float ring; uniform float uScroll, uLen; varying float vD, vB;
-    void main(){ vec3 p = position; vB = ring > 1.5 ? 2.4 : (ring > .5 ? .45 : .8);
+    void main(){ vec3 p = position; vB = ring > 1.5 ? 2.8 : (ring > .5 ? .16 : .8);
       if (ring > .5) p.z = -mod(-p.z - uScroll, uLen);
       vec4 mv = modelViewMatrix * vec4(p, 1.); vD = -mv.z; gl_Position = projectionMatrix * mv; }`,
   fragmentShader: `uniform vec3 uColor; uniform float uTime, uPump; varying float vD, vB;
@@ -144,7 +144,7 @@ function buildTunnel(rx, ry) {
   for (let i = 0; i <= nx; i++) { const x = -rx + 2 * rx * i / nx; seg(x, -ry, Z0, x, -ry, -TUNNEL_LEN, 0); seg(x, ry, Z0, x, ry, -TUNNEL_LEN, 0); }
   for (let i = 1; i < ny; i++) { const y = -ry + 2 * ry * i / ny; seg(-rx, y, Z0, -rx, y, -TUNNEL_LEN, 0); seg(rx, y, Z0, rx, y, -TUNNEL_LEN, 0); }
   for (let d = 0; d < TUNNEL_LEN; d += CELL) {
-    const z = -d, r = Math.round(d / CELL) % 4 === 0 ? 2 : 1;
+    const z = -d, r = Math.round(d / CELL) % 6 === 0 ? 2 : 1;
     seg(-rx, -ry, z, rx, -ry, z, r); seg(rx, -ry, z, rx, ry, z, r); seg(rx, ry, z, -rx, ry, z, r); seg(-rx, ry, z, -rx, -ry, z, r);
   }
   const g = new THREE.BufferGeometry();
@@ -461,7 +461,7 @@ let flySpeed = 8, flyPos = 0, acidS = 0.5;
 
 function frame(now) {
   requestAnimationFrame(frame);
-  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now;
   const t = now / 1000;
 
   if (camOn && landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
@@ -504,7 +504,7 @@ function frame(now) {
     // big face on screen = camera close; small face = far away
     const size = Math.max(fw, fh * 0.72) / Math.min(W, H);
     const far = Math.min(1, Math.max(0, (0.62 - size) / 0.42));
-    F.far = (F.far ?? far) + (far - (F.far ?? far)) * Math.min(1, dt * 4);
+    F.far = THREE.MathUtils.clamp((F.far ?? far) + (far - (F.far ?? far)) * Math.min(1, dt * 4), 0, 1);
     if (f === 0) audioOpen = F.far;                                       // close = main filter closed, far = open
   }
   if (!anyFace) headTarget.set(0, 0, 0);
@@ -535,16 +535,18 @@ function frame(now) {
   beamAng += (beat * (Math.PI / 7) - beamAng) * Math.min(1, dt * 14);   // beams snap one notch round on every beat
   spinT += dt * (0.25 + 5 * kick);                                       // boxes and rings lurch round on the beat, coast between
   // flying: face close = fast, far = slow
-  flySpeed += ((anyFace ? 8 + 5 * Math.pow(1 - audioOpen, 1.5) : 8) - flySpeed) * Math.min(1, dt * 3);
+  flySpeed += ((anyFace ? 8 + 5 * Math.pow(Math.max(0, 1 - audioOpen), 1.5) : 8) - flySpeed) * Math.min(1, dt * 3);
+  if (!isFinite(flySpeed)) flySpeed = 8;
+  if (!isFinite(flyPos)) flyPos = 0;
   acidS += (audioAcid - acidS) * Math.min(1, dt * 6);
   TUNNEL_COLOR.lerpColors(TUN_L, TUN_R, acidS);
   halo.visible = anyFace;
-  haloMat.uniforms.uI.value = 0.3 + 2.2 * kick;
+  haloMat.uniforms.uI.value = 0.15 + 1.1 * kick;
   beamMat.uniforms.uI.value = 0.55 + 1.5 * kick;
   for (const F of faces) F.edges.material.opacity = 0.18 + 0.6 * kick;   // the face's own edges flash too
   if (!reduceMotion) {
     flyPos += flySpeed * dt;
-    tunnelMat.uniforms.uScroll.value = flyPos % (CELL * 4);
+    tunnelMat.uniforms.uScroll.value = flyPos % (CELL * 6);
     tunnelMat.uniforms.uTime.value = t;
     tunnelMat.uniforms.uPump.value = 0.55 + 1.8 * kick;
     propMat.uniforms.uScroll.value = flyPos % TUNNEL_LEN;
@@ -558,7 +560,7 @@ function frame(now) {
   va.value += ((showVideo && camOn ? 0.45 : 0) - va.value) * Math.min(1, dt * 5);
   vidPlane.visible = va.value > 0.01;
 
-  fadeMat.uniforms.uFade.value = reduceMotion || vidPlane.visible ? 1 : 0.16;
+  fadeMat.uniforms.uFade.value = vidPlane.visible ? 1 : 1 - Math.pow(0.84, dt * 60);
   renderer.render(fadeScene, fadeCam);   // dim the previous frame instead of clearing it
   renderer.clearDepth();
   renderer.render(scene, cam);
