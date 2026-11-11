@@ -4,63 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Mesh Mirror</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400&display=swap">
 <style>
-  /* Full-bleed WebGL stage, one quiet HUD in the corner. Single dark look by choice. */
-  :root {
-    --ink: #04050a;
-    --line: #9be7ff;
-    --violet: #b28cff;
-    --text: #dfe8f2;
-    --muted: #7d8a9c;
-    --panel: rgba(10, 14, 24, 0.72);
-    --display: "Space Grotesk", system-ui, sans-serif;
-    --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-    color-scheme: dark;
-  }
-  html, body { height: 100%; margin: 0; background: var(--ink); color: var(--text); overflow: hidden; }
-  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  html, body { height: 100%; margin: 0; background: #04050a; overflow: hidden; }
+  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   video { display: none; }
-  .hud {
-    position: fixed; left: max(16px, env(safe-area-inset-left, 0px)); top: max(16px, env(safe-area-inset-top, 0px));
-    display: flex; flex-direction: column; gap: 10px; max-width: min(340px, calc(100vw - 32px));
-    padding: 14px 16px; background: var(--panel); border: 1px solid rgba(155, 231, 255, 0.15);
-    border-radius: 10px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-    transition: opacity .4s;
-  }
-  .hud.dim { opacity: 0.25; }
-  .hud.dim:hover { opacity: 1; }
-  h1 { font: 700 20px/1 var(--display); letter-spacing: 0.02em; margin: 0; }
-  h1 span { color: var(--line); }
-  .status { font: 400 12px/1.5 var(--mono); color: var(--muted); }
-  .status.err { color: #ff9b9b; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; }
-  button {
-    font: 500 13px/1 var(--display); color: var(--ink); background: var(--line);
-    border: 0; border-radius: 6px; padding: 9px 14px; cursor: pointer;
-  }
-  button.ghost { background: transparent; color: var(--text); border: 1px solid rgba(155, 231, 255, 0.3); }
-  button.ghost[aria-pressed="true"] { border-color: var(--line); color: var(--line); }
-  button:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
-  button:disabled { opacity: .5; cursor: default; }
-  .keys { font: 400 11px/1.6 var(--mono); color: var(--muted); }
 </style>
 </head>
 <body>
 <canvas id="stage"></canvas>
-<video id="cam" playsinline muted></video>
-
-<div class="hud" id="hud">
-  <h1>Mesh <span>Mirror</span></h1>
-  <div class="status" id="status">Loading face tracker…</div>
-  <div class="row">
-    <button id="camBtn" disabled>Turn on camera</button>
-    <button class="ghost" id="videoBtn" aria-pressed="false">Show video</button>
-    <button class="ghost" id="fsBtn">Fullscreen</button>
-  </div>
-  <div class="keys">468-point mesh · open your mouth for more particles<br>V video · F fullscreen · H hide panel</div>
-</div>
+<video id="cam" playsinline muted autoplay></video>
 
 <script type="importmap">
 { "imports": {
@@ -74,27 +26,35 @@ import * as THREE from "three";
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
 const MAX_FACES = 2;
-const BG_COUNT = 9000;
-const EMIT_MAX = 6000;
+const EMIT_MAX = 10000;
 const LINE_COLOR = new THREE.Color("#9be7ff");
 const VIOLET = new THREE.Color("#b28cff");
+const TUNNEL_COLOR = new THREE.Color("#ff7a1a");   // warm orange against the cyan/violet mesh
+const FOV = 50;
+const CAM_Z = 1 / Math.tan(THREE.MathUtils.degToRad(FOV / 2));   // z=0 plane spans y in [-1,1]
 
-const statusEl = document.getElementById("status");
-const camBtn = document.getElementById("camBtn");
-const videoBtn = document.getElementById("videoBtn");
-const fsBtn = document.getElementById("fsBtn");
-const hud = document.getElementById("hud");
 const video = document.getElementById("cam");
-const setStatus = (t, err = false) => { statusEl.textContent = t; statusEl.classList.toggle("err", err); };
 
 /* ---------- renderer / camera ---------- */
 const canvas = document.getElementById("stage");
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance" });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance", preserveDrawingBuffer: true });
+renderer.autoClear = false;   // previous frame stays and is faded each frame, which leaves trails
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setClearColor(0x04050a, 1);
 const scene = new THREE.Scene();
+const fadeScene = new THREE.Scene(), fadeCam = new THREE.Camera();
+const fadeMat = new THREE.ShaderMaterial({
+  uniforms: { uFade: { value: 0.16 } },
+  vertexShader: `void main(){ gl_Position = vec4(position.xy, 0., 1.); }`,
+  fragmentShader: `uniform float uFade; void main(){ gl_FragColor = vec4(.016, .02, .04, uFade); }`,
+  transparent: true, depthTest: false, depthWrite: false,
+});
+const fadeQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), fadeMat);
+fadeQuad.frustumCulled = false;
+fadeScene.add(fadeQuad);
 let aspect = 1;
-const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, -20, 20);
+const cam = new THREE.PerspectiveCamera(FOV, 1, 0.05, 200);
+cam.position.z = CAM_Z;
 
 /* ---------- video plane (dim mirrored feed, optional) ---------- */
 const vidTex = new THREE.VideoTexture(video);
@@ -108,7 +68,7 @@ const vidMat = new THREE.ShaderMaterial({
   depthWrite: false,
 });
 const vidPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), vidMat);
-vidPlane.position.z = -10;
+vidPlane.renderOrder = -2;
 vidPlane.visible = false;
 scene.add(vidPlane);
 let showVideo = false;
@@ -118,46 +78,107 @@ const pointFrag = `varying float vA; varying vec3 vC;
   void main(){ vec2 d = gl_PointCoord - .5; float r = length(d); if (r > .5) discard;
     float a = smoothstep(.5, .0, r); gl_FragColor = vec4(vC * a * vA, 1.); }`;
 
-/* ---------- background particle field (all on GPU) ---------- */
-const bgGeo = new THREE.BufferGeometry();
-const seeds = new Float32Array(BG_COUNT * 4);
-for (let i = 0; i < BG_COUNT; i++) {
-  seeds[i * 4] = Math.random() * 2 - 1;
-  seeds[i * 4 + 1] = Math.random() * 2 - 1;
-  seeds[i * 4 + 2] = Math.random();
-  seeds[i * 4 + 3] = Math.random();
-}
-bgGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(BG_COUNT * 3), 3));
-bgGeo.setAttribute("seed", new THREE.BufferAttribute(seeds, 4));
-const bgMat = new THREE.ShaderMaterial({
-  uniforms: {
-    uTime: { value: 0 }, uAspect: { value: 1 }, uPR: { value: renderer.getPixelRatio() },
-    uFace: { value: new THREE.Vector3(0, 0, 0.5) }, uFaceOn: { value: 0 }, uEnergy: { value: 0 },
-    uC1: { value: LINE_COLOR }, uC2: { value: VIOLET },
-  },
-  vertexShader: `attribute vec4 seed; uniform float uTime, uAspect, uPR, uFaceOn, uEnergy; uniform vec3 uFace, uC1, uC2;
-    varying float vA; varying vec3 vC;
-    void main(){
-      vec3 p = seed.xyz;
-      float sp = .015 + seed.w * .05;
-      p.y = mod(p.y + 1.0 + uTime * sp * (1. + uEnergy * 3.), 2.0) - 1.0;
-      p.x += .06 * sin(uTime * .25 + seed.w * 31. + p.y * 2.7) + .03 * sin(uTime * .7 + seed.z * 17.);
-      p.x *= uAspect * 1.05;
-      vec2 d = p.xy - uFace.xy; float r = length(d);
-      float push = uFaceOn * exp(-(r * r) / (uFace.z * uFace.z)) * (.35 + uEnergy * .4);
-      p.xy += normalize(d + 1e-5) * push;
-      float edge = smoothstep(1., .85, abs(p.y));
-      vA = (.25 + .75 * seed.z) * edge * (.55 + push * 1.5);
-      vC = mix(uC1, uC2, seed.w) * (.6 + uEnergy);
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(p.xy, -6. + seed.z, 1.);
-      gl_PointSize = (1.2 + seed.w * seed.z * 3.5) * uPR;
-    }`,
-  fragmentShader: pointFrag,
-  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+/* ---------- grid tunnel (pivots at the camera, turns with the head) ---------- */
+const TUNNEL_LEN = 36, CELL = 0.5;
+const tunnelMat = new THREE.ShaderMaterial({
+  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN }, uColor: { value: TUNNEL_COLOR }, uTime: { value: 0 } },
+  vertexShader: `attribute float ring; uniform float uScroll, uLen; varying float vD;
+    void main(){ vec3 p = position;
+      if (ring > .5) p.z = -mod(-p.z - uScroll, uLen);
+      vec4 mv = modelViewMatrix * vec4(p, 1.); vD = -mv.z; gl_Position = projectionMatrix * mv; }`,
+  fragmentShader: `uniform vec3 uColor; uniform float uTime; varying float vD;
+    void main(){ float a = exp(-vD * .1) * smoothstep(.3, 1.8, vD);
+      a *= .5 + .5 * sin(vD * .9 - uTime * 2.6);            // light pulses running down the tunnel
+      gl_FragColor = vec4(uColor * a * 1.5, 1.); }`,
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
 });
-const bgPoints = new THREE.Points(bgGeo, bgMat);
-bgPoints.frustumCulled = false;
-scene.add(bgPoints);
+
+/* wire boxes and ring pairs that fly past along the tunnel */
+const propMat = new THREE.ShaderMaterial({
+  uniforms: { uScroll: { value: 0 }, uLen: { value: TUNNEL_LEN } },
+  vertexShader: `attribute vec3 center, col; uniform float uScroll, uLen; varying float vD; varying vec3 vC;
+    void main(){ vec3 c = center; c.z = -mod(-c.z - uScroll, uLen);
+      vec4 mv = modelViewMatrix * vec4(c + position, 1.); vD = -mv.z; vC = col; gl_Position = projectionMatrix * mv; }`,
+  fragmentShader: `varying float vD; varying vec3 vC;
+    void main(){ float a = exp(-vD * .09) * smoothstep(.2, 1.4, vD); gl_FragColor = vec4(vC * a, 1.); }`,
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+});
+const props = new THREE.LineSegments(new THREE.BufferGeometry(), propMat);
+props.frustumCulled = false; props.renderOrder = -1;
+const PROP_COLORS = ["#ffb347", "#ffe066", "#ff3d81", "#35e0a1"].map(c => new THREE.Color(c));
+
+/* soft light beams fanning out from the far end */
+const beamMat = new THREE.ShaderMaterial({
+  vertexShader: `attribute vec4 col; varying vec4 vCol; void main(){ vCol = col; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }`,
+  fragmentShader: `varying vec4 vCol; void main(){ gl_FragColor = vec4(vCol.rgb * vCol.a, 1.); }`,
+  transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+});
+const beams = (() => {
+  const pos = [], col = [], pal = ["#ffd9a0", "#ff9ad5", "#9be7ff", "#fff2b0", "#b28cff", "#8dffd0", "#ffb38a"].map(c => new THREE.Color(c));
+  pal.forEach((c, i) => {
+    const a = i / pal.length * Math.PI * 2 + Math.random() * 0.5, w = 0.03 + Math.random() * 0.06, R = 5;
+    pos.push(0, 0, -TUNNEL_LEN, R * Math.cos(a - w), R * Math.sin(a - w), -0.5, R * Math.cos(a + w), R * Math.sin(a + w), -0.5);
+    col.push(c.r, c.g, c.b, 0.5, c.r, c.g, c.b, 0.06, c.r, c.g, c.b, 0.06);
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("col", new THREE.Float32BufferAttribute(col, 4));
+  const m = new THREE.Mesh(g, beamMat); m.frustumCulled = false; m.renderOrder = -1;
+  return m;
+})();
+const tunnel = new THREE.LineSegments(new THREE.BufferGeometry(), tunnelMat);
+tunnel.frustumCulled = false; tunnel.renderOrder = -1;
+const tunnelGroup = new THREE.Group();
+tunnelGroup.position.z = CAM_Z;
+tunnelGroup.add(tunnel, props, beams);
+scene.add(tunnelGroup);
+let tunnelKey = "";
+function buildTunnel(rx, ry) {
+  const key = rx.toFixed(2) + "/" + ry.toFixed(2);
+  if (key === tunnelKey) return;
+  tunnelKey = key;
+  const pos = [], ring = [];
+  const seg = (ax, ay, az, bx, by, bz, r) => { pos.push(ax, ay, az, bx, by, bz); ring.push(r, r); };
+  const nx = Math.max(2, Math.round(2 * rx / CELL)), ny = Math.max(2, Math.round(2 * ry / CELL));
+  const Z0 = 0;   // tunnel mouth sits at the camera, which is also the pivot
+  for (let i = 0; i <= nx; i++) { const x = -rx + 2 * rx * i / nx; seg(x, -ry, Z0, x, -ry, -TUNNEL_LEN, 0); seg(x, ry, Z0, x, ry, -TUNNEL_LEN, 0); }
+  for (let i = 1; i < ny; i++) { const y = -ry + 2 * ry * i / ny; seg(-rx, y, Z0, -rx, y, -TUNNEL_LEN, 0); seg(rx, y, Z0, rx, y, -TUNNEL_LEN, 0); }
+  for (let d = 0; d < TUNNEL_LEN; d += CELL) {
+    const z = -d;
+    seg(-rx, -ry, z, rx, -ry, z, 1); seg(rx, -ry, z, rx, ry, z, 1); seg(rx, ry, z, -rx, ry, z, 1); seg(-rx, ry, z, -rx, -ry, z, 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("ring", new THREE.Float32BufferAttribute(ring, 1));
+  tunnel.geometry.dispose();
+  tunnel.geometry = g;
+
+  const pp = [], pc = [], pk = [];
+  const pseg = (c, k, ax, ay, az, bx, by, bz) => { pp.push(ax, ay, az, bx, by, bz); pc.push(c[0], c[1], c[2], c[0], c[1], c[2]); pk.push(k.r, k.g, k.b, k.r, k.g, k.b); };
+  for (let n = 0; n < 44; n++) {
+    const k = PROP_COLORS[n % PROP_COLORS.length], d = -Math.random() * TUNNEL_LEN;
+    if (n % 3) {   // wire box hugging a wall
+      const w = 0.15 + Math.random() * 0.35, h = 0.15 + Math.random() * 0.5, dp = 0.2 + Math.random() * 0.8;
+      const onSide = Math.random() < 0.5, sgn = Math.random() < 0.5 ? -1 : 1;
+      const c = onSide ? [sgn * (rx - w), (Math.random() * 2 - 1) * (ry - h), d] : [(Math.random() * 2 - 1) * (rx - w), sgn * (ry - h), d];
+      for (const a of [-1, 1]) for (const b of [-1, 1]) {
+        pseg(c, k, -w, a * h, b * dp, w, a * h, b * dp); pseg(c, k, a * w, -h, b * dp, a * w, h, b * dp); pseg(c, k, a * w, b * h, -dp, a * w, b * h, dp);
+      }
+    } else {       // pair of concentric rings, kept away from the middle where the face is
+      const ang = Math.random() * Math.PI * 2, c = [Math.cos(ang) * rx * 0.72, Math.sin(ang) * ry * 0.72, d], r = 0.12 + Math.random() * 0.3, N = 36;
+      for (const rr of [r, r * 0.7]) for (let i = 0; i < N; i++) {
+        const a0 = i / N * Math.PI * 2, a1 = (i + 1) / N * Math.PI * 2;
+        pseg(c, k, rr * Math.cos(a0), rr * Math.sin(a0), 0, rr * Math.cos(a1), rr * Math.sin(a1), 0);
+      }
+    }
+  }
+  const pg = new THREE.BufferGeometry();
+  pg.setAttribute("position", new THREE.Float32BufferAttribute(pp, 3));
+  pg.setAttribute("center", new THREE.Float32BufferAttribute(pc, 3));
+  pg.setAttribute("col", new THREE.Float32BufferAttribute(pk, 3));
+  props.geometry.dispose();
+  props.geometry = pg;
+}
 
 /* ---------- emitted particles (CPU ring buffer) ---------- */
 const ePos = new Float32Array(EMIT_MAX * 3);
@@ -173,13 +194,16 @@ emGeo.setAttribute("life", new THREE.BufferAttribute(eLife, 1).setUsage(THREE.Dy
 emGeo.setAttribute("size", new THREE.BufferAttribute(eSize, 1));
 emGeo.setAttribute("hue", new THREE.BufferAttribute(eHue, 1));
 const emMat = new THREE.ShaderMaterial({
-  uniforms: { uPR: { value: renderer.getPixelRatio() }, uC1: { value: LINE_COLOR }, uC2: { value: VIOLET } },
-  vertexShader: `attribute float life, size, hue; uniform float uPR; uniform vec3 uC1, uC2; varying float vA; varying vec3 vC;
-    void main(){ vA = clamp(life, 0., 1.); vC = mix(uC1, uC2, hue) * 1.2;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.);
-      gl_PointSize = size * uPR * (.4 + .6 * vA); }`,
+  uniforms: { uPR: { value: renderer.getPixelRatio() }, uCamZ: { value: CAM_Z }, uC1: { value: LINE_COLOR }, uC2: { value: VIOLET }, uC3: { value: new THREE.Color("#ff3d81") } },
+  vertexShader: `attribute float life, size, hue; uniform float uPR, uCamZ; uniform vec3 uC1, uC2, uC3; varying float vA; varying vec3 vC;
+    void main(){
+      vec4 mv = modelViewMatrix * vec4(position, 1.); float d = max(.25, -mv.z);
+      float fade = smoothstep(1., .9, life) * smoothstep(0., .35, life);
+      vA = fade * exp(-max(0., d - uCamZ) * .12); vC = (hue > .82 ? uC3 : mix(uC1, uC2, hue / .82)) * 1.6;
+      gl_Position = projectionMatrix * mv;
+      gl_PointSize = size * uPR * clamp(uCamZ / d, .2, 4.); }`,
   fragmentShader: pointFrag,
-  transparent: true, depthWrite: false, depthTest: false, blending: THREE.AdditiveBlending,
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
 });
 const emPoints = new THREE.Points(emGeo, emMat);
 emPoints.frustumCulled = false;
@@ -196,34 +220,50 @@ const FEATURES = [
 const OVAL_IDX = [...new Set(OVAL.map(e => e.start))];
 const N_LM = 478;
 
-function makeLineObj(edges, color, opacity) {
-  const idx = new Uint16Array(edges.length * 2);
-  edges.forEach((e, i) => { idx[i * 2] = e.start; idx[i * 2 + 1] = e.end; });
-  const g = new THREE.BufferGeometry();
-  return { g, idx, color, opacity };
-}
+// triangles recovered from the tessellation edges (every 3-cycle of edges is one face of the mesh)
+const TRIS = (() => {
+  const adj = Array.from({ length: N_LM }, () => new Set());
+  for (const e of TESS) { adj[e.start].add(e.end); adj[e.end].add(e.start); }
+  const out = [];
+  for (let a = 0; a < N_LM; a++) for (const b of adj[a]) if (b > a) for (const c of adj[b]) if (c > b && adj[a].has(c)) out.push(a, b, c);
+  return out;
+})();
+// semi-transparent faceted face: each triangle is flat-shaded from a light that moves with the phone / head
+const uLight = { value: new THREE.Vector3(0.2, 0.4, 1).normalize() };
+const polyShader = {
+  vertexShader: `varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }`,
+  fragmentShader: `uniform vec3 uLight; varying vec3 vP;
+    void main(){
+      vec3 n = normalize(cross(dFdx(vP), dFdy(vP))); if (n.z < 0.) n = -n;     // one normal per triangle = faceted look
+      float diff = max(dot(n, uLight), 0.);
+      float spec = pow(max(dot(n, normalize(uLight + vec3(0., 0., 1.))), 0.), 24.);
+      float rim = pow(1. - n.z, 2.);
+      vec3 col = mix(vec3(.10, .04, .28), vec3(.42, .82, 1.), diff) + spec * vec3(1., .78, .5) + rim * vec3(.7, .25, .9) * .6;
+      float a = clamp(.14 + .32 * diff + .6 * spec + .3 * rim, 0., .8);
+      gl_FragColor = vec4(col, a); }`,
+};
 const faces = [];
 for (let f = 0; f < MAX_FACES; f++) {
   const pos = new Float32Array(N_LM * 3);
   const posAttr = new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage);
-  const mk = (edges, color, opacity) => {
+  const sg = new THREE.BufferGeometry();
+  sg.setAttribute("position", posAttr);
+  sg.setIndex(TRIS);
+  const mesh = new THREE.Mesh(sg, new THREE.ShaderMaterial({ uniforms: { uLight }, ...polyShader, side: THREE.DoubleSide, transparent: true, depthWrite: false, depthTest: false }));
+  mesh.frustumCulled = false; mesh.visible = false; mesh.renderOrder = 3; scene.add(mesh);
+  const mkLines = (edges, color, opacity, order) => {
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", posAttr);
     const idx = [];
     for (const e of edges) idx.push(e.start, e.end);
     g.setIndex(idx);
-    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false });
-    const l = new THREE.LineSegments(g, m);
-    l.frustumCulled = false; l.visible = false; scene.add(l);
+    const l = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }));
+    l.frustumCulled = false; l.visible = false; l.renderOrder = order; scene.add(l);
     return l;
   };
-  const mesh = mk(TESS, LINE_COLOR, 0.38);
-  const feat = mk(FEATURES, new THREE.Color("#e9f8ff"), 0.9);
-  const vg = new THREE.BufferGeometry();
-  vg.setAttribute("position", posAttr);
-  const verts = new THREE.Points(vg, new THREE.PointsMaterial({ color: LINE_COLOR, size: 2.2, sizeAttenuation: false, transparent: true, opacity: .7, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false }));
-  verts.frustumCulled = false; verts.visible = false; scene.add(verts);
-  faces.push({ pos, posAttr, mesh, feat, verts, seen: 0 });
+  const edges = mkLines(TESS, LINE_COLOR, 0.22, 4);
+  const feat = mkLines(FEATURES, new THREE.Color("#ffffff"), 0.9, 5);
+  faces.push({ pos, posAttr, mesh, edges, feat });
 }
 
 /* ---------- layout ---------- */
@@ -232,12 +272,12 @@ function layout() {
   const w = window.innerWidth, h = window.innerHeight;
   renderer.setSize(w, h, false);
   aspect = w / h;
-  cam.left = -aspect; cam.right = aspect; cam.top = 1; cam.bottom = -1;
+  cam.aspect = aspect;
   cam.updateProjectionMatrix();
+  buildTunnel(1.25 * Math.max(aspect, 0.6), 1.25);
   const va = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
   if (aspect > va) { W = 2 * aspect; H = W / va; } else { H = 2; W = H * va; }
   vidPlane.scale.set(W, H, 1);
-  bgMat.uniforms.uAspect.value = aspect;
 }
 window.addEventListener("resize", layout);
 layout();
@@ -251,65 +291,76 @@ async function loadTracker() {
       modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
       delegate,
     },
-    runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: true,
+    runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: false,
   });
   try { landmarker = await FaceLandmarker.createFromOptions(fileset, opts("GPU")); }
   catch (e) { console.warn("GPU delegate failed, using CPU", e); landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
 }
-loadTracker().then(() => {
-  setStatus("Ready. Your camera feed stays on this computer.");
-  camBtn.disabled = false;
-}).catch(e => { console.error(e); setStatus("Couldn't load the face tracker. Check your internet connection and reload.", true); });
+loadTracker().catch(e => console.error(e));
 
-let camOn = false;
+/* ---------- motion sensor: turning the phone turns the tunnel and moves the light ---------- */
+let sensorOn = false;
+const devQ = new THREE.Quaternion(), baseQ = new THREE.Quaternion(), relQ = new THREE.Quaternion(), targetQ = new THREE.Quaternion();
+const _e = new THREE.Euler(), _zee = new THREE.Vector3(0, 0, 1), _q0 = new THREE.Quaternion(), _id = new THREE.Quaternion();
+const _q1 = new THREE.Quaternion(-Math.SQRT1_2, 0, 0, Math.SQRT1_2);
+const lightDir = new THREE.Vector3();
+window.addEventListener("deviceorientation", (ev) => {
+  if (ev.alpha == null || ev.beta == null || ev.gamma == null) return;   // laptops fire this with no data
+  const d = Math.PI / 180, orient = (screen.orientation?.angle ?? window.orientation ?? 0) * d;
+  _e.set(ev.beta * d, ev.alpha * d, -ev.gamma * d, "YXZ");
+  devQ.setFromEuler(_e).multiply(_q1).multiply(_q0.setFromAxisAngle(_zee, -orient));
+  if (!sensorOn) { baseQ.copy(devQ); sensorOn = true; }
+});
+
+let camOn = false, camBusy = false;
 async function startCamera() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    setStatus("This browser has no camera access here. Open the file in Chrome, Edge or Firefox.", true); return;
-  }
-  camBtn.disabled = true; setStatus("Waiting for camera permission…");
+  if (camOn || camBusy || !navigator.mediaDevices?.getUserMedia) return;
+  camBusy = true;
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
     video.srcObject = stream;
     await video.play();
     camOn = true; layout();
-    setStatus("Tracking. Look at the camera.");
-    camBtn.textContent = "Camera on";
-    setTimeout(() => hud.classList.add("dim"), 2500);
-  } catch (e) {
-    console.error(e);
-    camBtn.disabled = false;
-    setStatus(e.name === "NotAllowedError" ? "Camera blocked. Allow it in the browser's address bar, then try again."
-      : e.name === "NotFoundError" ? "No camera found. Plug one in and try again."
-      : "Camera failed to start: " + e.message, true);
-  }
+  } catch (e) { console.error(e); }
+  camBusy = false;
 }
-camBtn.addEventListener("click", startCamera);
+startCamera();   // the browser's own permission prompt appears as soon as the page opens
 
-function toggleVideo() { showVideo = !showVideo; videoBtn.setAttribute("aria-pressed", String(showVideo)); videoBtn.textContent = showVideo ? "Hide video" : "Show video"; }
-videoBtn.addEventListener("click", toggleVideo);
+// A tap anywhere retries the camera if it was blocked, and unlocks the motion sensor on iPhone (it may only be asked for from a tap).
+window.addEventListener("pointerdown", () => {
+  startCamera();
+  if (!sensorOn && typeof DeviceOrientationEvent !== "undefined" && DeviceOrientationEvent.requestPermission) DeviceOrientationEvent.requestPermission().catch(() => {});
+});
 function toggleFS() { (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.())?.catch?.(() => {}); }
-fsBtn.addEventListener("click", toggleFS);
 window.addEventListener("keydown", (e) => {
-  if (e.key === "v" || e.key === "V") toggleVideo();
+  if (e.key === "v" || e.key === "V") showVideo = !showVideo;
   else if (e.key === "f" || e.key === "F") toggleFS();
-  else if (e.key === "h" || e.key === "H") hud.hidden = !hud.hidden;
 });
 
 /* ---------- loop ---------- */
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
-let last = performance.now(), lastVideoTime = -1, energy = 0, faceTarget = new THREE.Vector3(0, 0, .5), faceOn = 0;
+let last = performance.now(), lastVideoTime = -1;
 let results = null;
+const faceC = new THREE.Vector2(0, 0), faceTarget = new THREE.Vector2(0, 0);   // swirl axis follows the face
+const headTarget = new THREE.Vector3(0, 0, 0);                                  // tunnel rotation target (x, y, z)
+let emitAcc = 0;
+const SWIRL = 0.32, TURB = 0.55, DRAG = 0.45;
 
-function spawn(x, y, z, cx, cy, boost) {
+// Start just inside the face outline and behind the mask, so particles emerge from behind it.
+function spawn(F, cx, cy, fw) {
   const i = eHead; eHead = (eHead + 1) % EMIT_MAX;
+  const k = OVAL_IDX[(Math.random() * OVAL_IDX.length) | 0] * 3;
+  const s = 0.15 + Math.random() * 0.7;
+  const x = cx + (F.pos[k] - cx) * s, y = cy + (F.pos[k + 1] - cy) * s;
   let dx = x - cx, dy = y - cy; const l = Math.hypot(dx, dy) || 1; dx /= l; dy /= l;
-  const sp = (0.08 + Math.random() * 0.25) * (1 + boost * 2);
-  ePos[i * 3] = x; ePos[i * 3 + 1] = y; ePos[i * 3 + 2] = z;
-  eVel[i * 3] = dx * sp + (Math.random() - .5) * .05;
-  eVel[i * 3 + 1] = dy * sp + (Math.random() - .5) * .05 + .03;
-  eVel[i * 3 + 2] = 0;
-  eMax[i] = 1.2 + Math.random() * 1.8; eLife[i] = 1;
-  eSize[i] = 1.5 + Math.random() * 3.5; eHue[i] = Math.random();
+  const out = 0.2 + Math.random() * 0.5, sw = 0.4 + Math.random() * 0.7;
+  const j = i * 3;
+  ePos[j] = x; ePos[j + 1] = y; ePos[j + 2] = -fw * (0.35 + Math.random() * 0.3);
+  eVel[j] = dx * out - dy * sw;
+  eVel[j + 1] = dy * out + dx * sw;
+  eVel[j + 2] = Math.random() < 0.4 ? Math.random() * 0.5 : -(0.05 + Math.random() * 0.5);
+  eMax[i] = 3.5 + Math.random() * 4.5; eLife[i] = 1;
+  eSize[i] = 2.5 + Math.random() * 4.5; eHue[i] = Math.random();
 }
 
 function frame(now) {
@@ -322,52 +373,84 @@ function frame(now) {
     results = landmarker.detectForVideo(video, now);
   }
 
-  let anyFace = false, jaw = 0;
+  let anyFace = false;
   for (let f = 0; f < MAX_FACES; f++) {
     const F = faces[f];
     const lm = results?.faceLandmarks?.[f];
     const on = !!lm;
-    F.mesh.visible = F.feat.visible = F.verts.visible = on;
+    F.mesh.visible = F.edges.visible = F.feat.visible = on;
     if (!on) continue;
-    anyFace = true;
-    let cx = 0, cy = 0, minX = 1e9, maxX = -1e9;
+    let cx = 0, cy = 0;
     for (let i = 0; i < lm.length && i < N_LM; i++) {
       const x = (0.5 - lm[i].x) * W, y = (0.5 - lm[i].y) * H, z = -lm[i].z * W;
       F.pos[i * 3] = x; F.pos[i * 3 + 1] = y; F.pos[i * 3 + 2] = z;
-      cx += x; cy += y; if (x < minX) minX = x; if (x > maxX) maxX = x;
+      cx += x; cy += y;
     }
     F.posAttr.needsUpdate = true;
     cx /= lm.length; cy /= lm.length;
-    const bs = results.faceBlendshapes?.[f]?.categories;
-    if (bs) { const j = bs.find(c => c.categoryName === "jawOpen"); if (j) jaw = Math.max(jaw, j.score); }
-    F.mesh.material.opacity = 0.3 + 0.1 * Math.sin(t * 2.0) + jaw * 0.3;
-    if (f === 0) faceTarget.set(cx, cy, Math.max(0.2, (maxX - minX) * 0.75));
+
+    // cheek-to-cheek and forehead-to-chin spans: face size on screen, plus head turn
+    const P = F.pos, nose = 3, top = 30, chin = 456;
+    let lx = P[702], ly = P[703], rx = P[1362], ry = P[1363];
+    if (lx > rx) { [lx, rx] = [rx, lx]; [ly, ry] = [ry, ly]; }
+    const fw = Math.hypot(rx - lx, ry - ly) || 1e-3;
+    const fh = Math.hypot(P[top] - P[chin], P[top + 1] - P[chin + 1]) || 1e-3;
+    if (!anyFace) {
+      const yaw = (P[nose] - (lx + rx) / 2) / fw;
+      const pitch = (P[nose + 1] - (P[top + 1] + P[chin + 1]) / 2) / fh;
+      const cl = THREE.MathUtils.clamp;
+      headTarget.set(cl(pitch * 0.9, -0.45, 0.45), cl(-yaw * 0.9, -0.5, 0.5), cl(Math.atan2(ry - ly, rx - lx) * 0.6, -0.5, 0.5));
+      faceTarget.set(cx, cy);
+    }
+    anyFace = true;
+
+    // big face on screen = camera close = few particles; small face = far = many
+    const size = Math.max(fw, fh * 0.72) / Math.min(W, H);
+    const far = Math.min(1, Math.max(0, (0.62 - size) / 0.42));
+    F.far = (F.far ?? far) + (far - (F.far ?? far)) * Math.min(1, dt * 4);
     if (!reduceMotion) {
-      const n = Math.floor((25 + jaw * 260) * dt * 60 / 10);
-      for (let k = 0; k < n; k++) {
-        const useOval = Math.random() < 0.7;
-        const idx = useOval ? OVAL_IDX[(Math.random() * OVAL_IDX.length) | 0] : (Math.random() * 468) | 0;
-        spawn(F.pos[idx * 3], F.pos[idx * 3 + 1], F.pos[idx * 3 + 2], cx, cy, jaw);
-      }
+      emitAcc += (40 + 1700 * F.far * F.far) * dt;
+      const n = Math.floor(emitAcc); emitAcc -= n;
+      for (let k = 0; k < n; k++) spawn(F, cx, cy, fw);
     }
   }
+  if (!anyFace) headTarget.set(0, 0, 0);
 
-  energy += ((anyFace ? jaw : 0) - energy) * Math.min(1, dt * 6);
-  faceOn += ((anyFace ? 1 : 0) - faceOn) * Math.min(1, dt * 3);
-  bgMat.uniforms.uFace.value.lerp(faceTarget, Math.min(1, dt * 8));
-  bgMat.uniforms.uFaceOn.value = faceOn;
-  bgMat.uniforms.uEnergy.value = energy;
-  bgMat.uniforms.uTime.value = reduceMotion ? 0 : t;
+  faceC.lerp(faceTarget, Math.min(1, dt * 6));
+  if (sensorOn) {
+    baseQ.slerp(devQ, Math.min(1, dt * 0.25));            // slowly re-centre, so a new resting pose becomes "straight ahead"
+    relQ.copy(baseQ).invert().multiply(devQ);             // how far the phone has turned from rest
+    if (relQ.w < 0) relQ.set(-relQ.x, -relQ.y, -relQ.z, -relQ.w);
+    const ang = 2 * Math.acos(Math.min(1, relQ.w));
+    if (ang > 0.6) relQ.slerpQuaternions(_id, relQ, 0.6 / ang);
+    targetQ.copy(relQ).invert();                          // world stays put while the phone turns
+  } else {
+    targetQ.setFromEuler(_e.set(headTarget.x, headTarget.y, headTarget.z, "XYZ"));
+  }
+  tunnelGroup.quaternion.slerp(targetQ, Math.min(1, dt * (sensorOn ? 12 : 5)));
+  lightDir.set(0, 0, -1).applyQuaternion(tunnelGroup.quaternion);       // light sits toward the tunnel's far end, exaggerated
+  uLight.value.set(lightDir.x * 3 + 0.15, lightDir.y * 3 + 0.35, 1).normalize();
+  if (!reduceMotion) {
+    tunnelMat.uniforms.uScroll.value = (t * 0.6) % CELL;
+    tunnelMat.uniforms.uTime.value = t;
+    propMat.uniforms.uScroll.value = (t * 2.2) % TUNNEL_LEN;
+    beams.rotation.z = t * 0.07;
+  }
 
-  // emitted particle physics
+  // particle physics: swirl around the face axis + per-particle turbulence, in 3D
+  const drag = 1 - DRAG * dt;
   for (let i = 0; i < EMIT_MAX; i++) {
     if (eLife[i] <= 0) continue;
     eLife[i] -= dt / eMax[i];
-    const j = i * 3;
-    eVel[j] += Math.sin(ePos[j + 1] * 6 + t) * 0.02 * dt;
-    eVel[j + 1] += 0.04 * dt;
-    eVel[j] *= 1 - 0.6 * dt; eVel[j + 1] *= 1 - 0.6 * dt;
-    ePos[j] += eVel[j] * dt; ePos[j + 1] += eVel[j + 1] * dt;
+    const j = i * 3, ph = eHue[i] * 6.283;
+    const x = ePos[j] - faceC.x, y = ePos[j + 1] - faceC.y, z = ePos[j + 2];
+    const r2 = x * x + y * y + 0.15;
+    const ax = -y / r2 * SWIRL + TURB * (Math.sin(y * 2.3 + t * 0.7 + ph) + Math.sin(z * 3.1 - t * 0.5 + ph * 1.7));
+    const ay = x / r2 * SWIRL + TURB * (Math.sin(z * 2.1 + t * 0.6 + ph) + Math.sin(x * 2.9 + t * 0.4 + ph * 2.3));
+    const az = TURB * (Math.sin(x * 2.5 - t * 0.8 + ph) + Math.sin(y * 1.9 + t * 0.3 + ph * 1.3));
+    eVel[j] = (eVel[j] + ax * dt) * drag; eVel[j + 1] = (eVel[j + 1] + ay * dt) * drag; eVel[j + 2] = (eVel[j + 2] + az * dt) * drag;
+    ePos[j] += eVel[j] * dt; ePos[j + 1] += eVel[j + 1] * dt; ePos[j + 2] += eVel[j + 2] * dt;
+    if (ePos[j + 2] > CAM_Z - 0.4) eLife[i] = 0;
   }
   emGeo.attributes.position.needsUpdate = true;
   emGeo.attributes.life.needsUpdate = true;
@@ -378,6 +461,9 @@ function frame(now) {
   va.value += ((showVideo && camOn ? 0.45 : 0) - va.value) * Math.min(1, dt * 5);
   vidPlane.visible = va.value > 0.01;
 
+  fadeMat.uniforms.uFade.value = reduceMotion || vidPlane.visible ? 1 : 0.16;
+  renderer.render(fadeScene, fadeCam);   // dim the previous frame instead of clearing it
+  renderer.clearDepth();
   renderer.render(scene, cam);
 }
 requestAnimationFrame(frame);
