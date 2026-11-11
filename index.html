@@ -25,7 +25,10 @@
 import * as THREE from "three";
 import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 
-const MAX_FACES = 2;
+// Phones get a lighter version: less memory and graphics load, which is what makes a mobile browser kill a page.
+// Adding ?lite to the address forces it on any device.
+const LITE = (matchMedia("(pointer: coarse)").matches && Math.min(screen.width, screen.height) < 900) || location.search.includes("lite");
+const MAX_FACES = LITE ? 1 : 2;
 const LINE_COLOR = new THREE.Color("#9be7ff");
 const VIOLET = new THREE.Color("#b28cff");
 const TUNNEL_COLOR = new THREE.Color("#ff7a1a");
@@ -37,9 +40,9 @@ const video = document.getElementById("cam");
 
 /* ---------- renderer / camera ---------- */
 const canvas = document.getElementById("stage");
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: "high-performance", preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !LITE, alpha: false, powerPreference: "high-performance", preserveDrawingBuffer: true });
 renderer.autoClear = false;   // previous frame stays and is faded each frame, which leaves trails
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, LITE ? 1.25 : 2));
 renderer.setClearColor(0x04050a, 1);
 const scene = new THREE.Scene();
 const fadeScene = new THREE.Scene(), fadeCam = new THREE.Camera();
@@ -156,7 +159,7 @@ function buildTunnel(rx, ry) {
   const pp = [], pc = [], pk = [], ps = [];
   let sp = [0, 0, 0];
   const pseg = (c, k, ax, ay, az, bx, by, bz) => { pp.push(ax, ay, az, bx, by, bz); pc.push(c[0], c[1], c[2], c[0], c[1], c[2]); pk.push(k.r, k.g, k.b, k.r, k.g, k.b); ps.push(sp[0], sp[1], sp[2], sp[0], sp[1], sp[2]); };
-  for (let n = 0; n < 44; n++) {
+  for (let n = 0; n < (LITE ? 20 : 44); n++) {
     sp = [(Math.random() - 0.5) * 2.6, (Math.random() - 0.5) * 1.8, Math.random() * 6.28];
     const k = PROP_COLORS[n % PROP_COLORS.length], d = -Math.random() * TUNNEL_LEN;
     if (n % 3) {   // wire box hugging a wall
@@ -304,7 +307,7 @@ async function startCamera() {
   if (camOn || camBusy || !navigator.mediaDevices?.getUserMedia) return;
   camBusy = true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: LITE ? 640 : 1280 }, height: { ideal: LITE ? 480 : 720 }, facingMode: "user" }, audio: false });
     video.srcObject = stream;
     await video.play();
     camOn = true; layout();
@@ -344,7 +347,7 @@ function buildAudio(ctx) {
   A.mainG = ctx.createGain(); A.mainG.gain.value = 0.7;
   A.mainLP.connect(A.mainLP2).connect(A.mainG).connect(A.master);
   A.kicks = []; A.acid = 0.5; A.acidVol = 1;
-  const len = Math.floor(ctx.sampleRate * 3.2), ir = ctx.createBuffer(2, len, ctx.sampleRate);
+  const len = Math.floor(ctx.sampleRate * (LITE ? 1.6 : 3.2)), ir = ctx.createBuffer(2, len, ctx.sampleRate);
   for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3.2); }
   A.rev = ctx.createConvolver(); A.rev.buffer = ir;
   const revG = ctx.createGain(); revG.gain.value = 0.5; A.rev.connect(revG).connect(A.mainLP);
@@ -453,7 +456,7 @@ function initAudio() {
 
 /* ---------- loop ---------- */
 const reduceMotion = false;
-let last = performance.now(), lastVideoTime = -1;
+let last = performance.now(), lastVideoTime = -1, lastDetect = 0;
 let results = null;
 const headTarget = new THREE.Vector3(0, 0, 0);                                  // tunnel rotation target (x, y, z)
 let beat = 0, prevKick = 0, beamAng = 0, spinT = 0;
@@ -464,8 +467,8 @@ function frame(now) {
   const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now;
   const t = now / 1000;
 
-  if (camOn && landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
+  if (camOn && landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime && (!LITE || now - lastDetect > 45)) {
+    lastVideoTime = video.currentTime; lastDetect = now;   // phones track the face about 20 times a second instead of every frame
     results = landmarker.detectForVideo(video, now);
   }
 
