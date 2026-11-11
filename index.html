@@ -273,18 +273,31 @@ window.addEventListener("resize", layout);
 layout();
 
 /* ---------- face tracker ---------- */
-let landmarker = null;
+let landmarker = null, fileset = null, detectErrs = 0, rebuilding = false;
+const trackerOpts = (delegate) => ({
+  baseOptions: {
+    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+    delegate,
+  },
+  runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: false,
+});
 async function loadTracker() {
-  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-  const opts = (delegate) => ({
-    baseOptions: {
-      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-      delegate,
-    },
-    runningMode: "VIDEO", numFaces: MAX_FACES, outputFaceBlendshapes: false,
-  });
-  try { landmarker = await FaceLandmarker.createFromOptions(fileset, opts("GPU")); }
-  catch (e) { console.warn("GPU delegate failed, using CPU", e); landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
+  fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  // Phones run the tracker on the processor: on a phone's graphics chip it can stall or fail at start-up and take the page with it.
+  if (!LITE) {
+    try { landmarker = await FaceLandmarker.createFromOptions(fileset, trackerOpts("GPU")); return; }
+    catch (e) { console.warn("GPU tracker failed, using CPU", e); }
+  }
+  landmarker = await FaceLandmarker.createFromOptions(fileset, trackerOpts("CPU"));
+}
+// If the tracker keeps failing mid-run, swap it for a processor-based one instead of letting it stop the picture.
+async function rebuildTracker() {
+  if (rebuilding || !fileset) return;
+  rebuilding = true;
+  const old = landmarker; landmarker = null;
+  try { old?.close(); } catch (e) {}
+  try { landmarker = await FaceLandmarker.createFromOptions(fileset, trackerOpts("CPU")); detectErrs = 0; } catch (e) { console.error(e); }
+  rebuilding = false;
 }
 loadTracker().catch(e => console.error(e));
 
@@ -462,14 +475,14 @@ const headTarget = new THREE.Vector3(0, 0, 0);                                  
 let beat = 0, prevKick = 0, beamAng = 0, spinT = 0;
 let flySpeed = 8, flyPos = 0, acidS = 0.5;
 
-function frame(now) {
-  requestAnimationFrame(frame);
+function update(now) {
   const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now;
   const t = now / 1000;
 
-  if (camOn && landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime && (!LITE || now - lastDetect > 45)) {
+  if (camOn && landmarker && video.readyState >= 2 && video.videoWidth > 0 && video.currentTime !== lastVideoTime && (!LITE || now - lastDetect > 45)) {
     lastVideoTime = video.currentTime; lastDetect = now;   // phones track the face about 20 times a second instead of every frame
-    results = landmarker.detectForVideo(video, now);
+    try { results = landmarker.detectForVideo(video, now); detectErrs = 0; }
+    catch (e) { console.error(e); if (++detectErrs >= 3) rebuildTracker(); }
   }
 
   let anyFace = false;
@@ -564,6 +577,13 @@ function frame(now) {
   vidPlane.visible = va.value > 0.01;
 
   fadeMat.uniforms.uFade.value = vidPlane.visible ? 1 : 1 - Math.pow(0.84, dt * 60);
+}
+
+// The picture is drawn every frame no matter what: an error in tracking or audio can no longer freeze it.
+let frameErr = null;
+function frame(now) {
+  requestAnimationFrame(frame);
+  try { update(now); } catch (e) { if (!frameErr) { frameErr = e; console.error(e); } }
   renderer.render(fadeScene, fadeCam);   // dim the previous frame instead of clearing it
   renderer.clearDepth();
   renderer.render(scene, cam);
